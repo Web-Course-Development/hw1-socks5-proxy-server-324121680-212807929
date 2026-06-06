@@ -21,6 +21,7 @@ const (
 
 	cmdConnect = 0x01
 	atypIPv4   = 0x01
+	atypDomain = 0x03
 )
 
 func main() {
@@ -48,20 +49,25 @@ func main() {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	// 1. greeting + pick the auth method
 	method, err := negotiateAuth(conn)
 	if err != nil {
 		return
 	}
 
+	// 2. username/password sub-negotiation if we asked for it
 	if method == methodUserPass {
 		if err := authenticateUserPass(conn); err != nil {
 			return
 		}
 	}
 
+	// 3-6. read CONNECT, dial the target, reply, relay
 	handleConnect(conn)
 }
 
+// negotiateAuth reads the client greeting and replies with the method we want.
+// no-auth by default; username/password when PROXY_USER is set.
 func negotiateAuth(conn net.Conn) (byte, error) {
 	header := make([]byte, 2) // VER, NMETHODS
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -86,10 +92,12 @@ func negotiateAuth(conn net.Conn) (byte, error) {
 		return want, nil
 	}
 
+	// client doesn't offer the method we need
 	conn.Write([]byte{socksVersion, methodNoAccept})
 	return 0, fmt.Errorf("no acceptable auth method")
 }
 
+// authenticateUserPass runs the RFC 1929 sub-negotiation (version byte 0x01).
 func authenticateUserPass(conn net.Conn) error {
 	head := make([]byte, 2) // VER, ULEN
 	if _, err := io.ReadFull(conn, head); err != nil {
@@ -121,6 +129,7 @@ func authenticateUserPass(conn net.Conn) error {
 	return fmt.Errorf("bad credentials")
 }
 
+// handleConnect reads the CONNECT request, dials the target, replies, and relays.
 func handleConnect(conn net.Conn) {
 	head := make([]byte, 4) // VER, CMD, RSV, ATYP
 	if _, err := io.ReadFull(conn, head); err != nil {
@@ -154,7 +163,7 @@ func handleConnect(conn net.Conn) {
 	relay(conn, target)
 }
 
-// readAddress reads DST.ADDR. only IPv4 for now (domain comes next).
+// readAddress reads DST.ADDR for the given address type and returns it as a host string.
 func readAddress(conn net.Conn, atyp byte) (string, error) {
 	switch atyp {
 	case atypIPv4:
@@ -163,15 +172,28 @@ func readAddress(conn net.Conn, atyp byte) (string, error) {
 			return "", err
 		}
 		return net.IP(buf).String(), nil
+	case atypDomain:
+		lenBuf := make([]byte, 1)
+		if _, err := io.ReadFull(conn, lenBuf); err != nil {
+			return "", err
+		}
+		name := make([]byte, lenBuf[0])
+		if _, err := io.ReadFull(conn, name); err != nil {
+			return "", err
+		}
+		return string(name), nil // Go resolves the domain in net.Dial
 	default:
 		return "", fmt.Errorf("unsupported address type %d", atyp)
 	}
 }
 
+// reply sends a SOCKS5 reply with the given code. we always use ATYP=IPv4 and an
+// all-zero bound address/port (allowed by the RFC and simpler than the real one).
 func reply(conn net.Conn, code byte) {
 	conn.Write([]byte{socksVersion, code, 0x00, atypIPv4, 0, 0, 0, 0, 0, 0})
 }
 
+// relay copies data in both directions until both sides are done.
 func relay(client, target net.Conn) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -188,12 +210,14 @@ func relay(client, target net.Conn) {
 	wg.Wait()
 }
 
+// closeWrite half-closes a TCP connection (signals EOF to the other side).
 func closeWrite(conn net.Conn) {
 	if c, ok := conn.(interface{ CloseWrite() error }); ok {
 		c.CloseWrite()
 	}
 }
 
+// offers reports whether the client offered the auth method we want.
 func offers(methods []byte, want byte) bool {
 	for _, m := range methods {
 		if m == want {
